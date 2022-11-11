@@ -1,5 +1,12 @@
-import { APIGatewayProxyEvent, APIGatewayProxyEventQueryStringParameters, APIGatewayProxyResult } from "aws-lambda";
+import {
+  APIGatewayProxyEvent,
+  APIGatewayProxyEventQueryStringParameters,
+  APIGatewayProxyResult,
+} from "aws-lambda";
 import AWS, { AWSError } from "aws-sdk";
+import { DocumentClient, Key } from "aws-sdk/clients/dynamodb";
+
+
 
 
 type Action = "$connect" | "$disconnect" | "getMessages" | "sendMessages" | "getClients";
@@ -9,7 +16,7 @@ type Client = {
 }
 
 
-const docClinet  = new AWS.DynamoDB.DocumentClient();
+const docClient = new AWS.DynamoDB.DocumentClient();
 const CLIENT_TABLE_NAME = "Clients";
 const apiGw = new AWS.ApiGatewayManagementApi({
   endpoint: process.env["WSSAPIGATEWAYENDPOINT"]
@@ -20,6 +27,12 @@ const responseOK = {
     statusCode: 200,
     body: "",
 
+}
+
+const responseForbidden = {
+
+  statusCode: 403,
+  body: "",
 }
   
 
@@ -38,6 +51,9 @@ export const handle = async (event: APIGatewayProxyEvent): Promise<APIGatewayPro
 
     case "getClients":
       return handleGetClients(connectionId);
+    
+    case "sendMessage" :
+      return 
 
     
     default:
@@ -58,35 +74,81 @@ export const handle = async (event: APIGatewayProxyEvent): Promise<APIGatewayPro
 };
 
 
-const handleConnect = async(connectionId:string, queryParams: APIGatewayProxyEventQueryStringParameters | null,): Promise<APIGatewayProxyResult> => {
-  if (!queryParams || !queryParams['nickname']) {
+const handleConnect = async(connectionId:string, queryParams: APIGatewayProxyEventQueryStringParameters | null,): 
+Promise<APIGatewayProxyResult> => {
+  if (!queryParams || !queryParams["nickname"]) {
     return {
       statusCode: 403,
       body: "",
 
-    };
+    };   
 
     }
 
-    await docClinet.put({
+// DUPLICATE NICKNAME RESOLVE
+// edge case where client with the same nickname try to connect
+// since nickname is used as secondary index
+
+const getConnectionIdByNickname = async (
+  nickname: string,
+): Promise<string | undefined> => {
+  const output = await docClient
+    .query({
       TableName: CLIENT_TABLE_NAME,
-      Item: {
-        connectionId,
-        nickname: queryParams["nickname"],
+      IndexName: "NicknameIndex",
+      KeyConditionExpression: "#nickname = :nickname",
+      ExpressionAttributeNames: {
+        "#nickname": "nickname",
       },
+      ExpressionAttributeValues: {
+        ":nickname": nickname,
+      },
+    })
+    .promise();
 
-    }).promise();
+  return output.Items && output.Items.length > 0
+    ? output.Items[0].connectionId
+    : undefined;
+};
 
-  await notifyClients(connectionId);
-    return responseOK
+// for that nickname if count > 0 is that it means the connection exist
 
+const existingConnectionId = await getConnectionIdByNickname(
+
+  queryParams["nickname"],
+
+);
+
+if (
+  existingConnectionId &&
+  (await postToConnection(
+    existingConnectionId,
+    JSON.stringify({ type: "ping" }),
+  ))
+) {
+  return responseForbidden;
+}
+
+  // otherwise the client is gone then we allow and add the client
+  await docClient.put({
+    TableName: CLIENT_TABLE_NAME,
+    Item: {
+      connectionId,
+      nickname: queryParams["nickname"],
+    },
+
+  }).promise();
+
+await notifyClients(connectionId); 
+return responseOK
   
 };
 
 
+
 const handleDisconnect = async(connectionId:string): Promise<APIGatewayProxyResult> => {
  
-    await docClinet.delete({
+    await docClient.delete({
       TableName: CLIENT_TABLE_NAME,
       Key: {
         connectionId,
@@ -101,8 +163,10 @@ const handleDisconnect = async(connectionId:string): Promise<APIGatewayProxyResu
 
   
 };
+
+
 const getAllClients = async():Promise<Client[]> => {
-  const output = await docClinet.scan({
+  const output = await docClient.scan({
     TableName: CLIENT_TABLE_NAME,
   
   }).promise();
@@ -120,7 +184,7 @@ const notifyClients = async(connectionIdToExclude:string)=>{
     clients.filter((client: { connectionId: string; })=> client.connectionId !== connectionIdToExclude)
     .map(async (client: { connectionId: string; })=>{
 
-    await postToConnection(client.connectionId, JSON.stringify(clients));
+    await postToConnection(client.connectionId, createClientMessage(clients));
 
   }),
   
@@ -128,8 +192,8 @@ const notifyClients = async(connectionIdToExclude:string)=>{
 
 };
 
-// function for post connection 
-const postToConnection = async(connectionId:string, data:string) => {
+// function for post connection and it also act as flag
+const postToConnection = async(connectionId:string, data:string): Promise<boolean> => {
 
   try {
 
@@ -138,17 +202,19 @@ const postToConnection = async(connectionId:string, data:string) => {
       Data: data,
 
     }).promise();
+    return true;
 
   } catch (e) {
     if ((e as AWSError).statusCode !== 410) { // check if whether the client is gone or not...
     //since we worry about real time activity gone is not supported so throw error
     throw(e);
+
   }
   
 
   // if the client is gone for some reason according to status code 410 we delete since we worry about real time data
 
-  await docClinet.delete({
+  await docClient.delete({
     TableName: CLIENT_TABLE_NAME,
     Key: {
       connectionId,
@@ -158,7 +224,7 @@ const postToConnection = async(connectionId:string, data:string) => {
 
   }).promise();
 
-  
+  return false
 
 
 }
@@ -170,14 +236,19 @@ const postToConnection = async(connectionId:string, data:string) => {
 const handleGetClients = async(connectionId:string): Promise<APIGatewayProxyResult> => {
  
   const clients = await getAllClients();
-   // sends message to connected client
 
-  await postToConnection(connectionId, JSON.stringify(clients));
+   // sends message to connected client
+   // in contrary get message provides detail info about the connection
+  await postToConnection(connectionId, createClientMessage(clients));
 
   return responseOK
       
 
 
 };
+
+const createClientMessage = (clients:Client[]):string => 
+
+  JSON.stringify({type:"clients", value: {clients}} )
 
 

@@ -2,7 +2,7 @@
 
 service: serverless-chat
 
-frameworkVersion: "2"
+frameworkVersion: "3.24.0"
 
 provider:
   name: aws
@@ -58,7 +58,7 @@ provider:
 
 functions:
   websocketHandler:
-    handler: src/handler.handle
+    handler: src/handlers.handle
     events:
       - websocket:
           route: $connect
