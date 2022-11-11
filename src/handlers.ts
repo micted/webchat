@@ -3,11 +3,12 @@ import {
   APIGatewayProxyEventQueryStringParameters,
   APIGatewayProxyResult,
 } from "aws-lambda";
-import AWS, { AWSError } from "aws-sdk";
+import AWS, { APIGateway, AWSError } from "aws-sdk";
 import { DocumentClient, Key } from "aws-sdk/clients/dynamodb";
+import { v4 } from "uuid";
 
 
-
+class HandlerError extends Error {}
 
 type Action = "$connect" | "$disconnect" | "getMessages" | "sendMessages" | "getClients";
 type Client = {
@@ -15,9 +16,25 @@ type Client = {
   nickname: string;
 }
 
+type SendMessage = {
+
+  message: string;
+  recipentNickname: string;
+}
+
+type  GetMessage = {
+  // the sender name
+  targetNickname: string;
+  recipentNickname: string;
+  limit: number; // pagination
+  startKey: Key | undefined;
+};
+
+
 
 const docClient = new AWS.DynamoDB.DocumentClient();
 const CLIENT_TABLE_NAME = "Clients";
+const MESSAGE_TABLE_NAME ="Messages"
 const apiGw = new AWS.ApiGatewayManagementApi({
   endpoint: process.env["WSSAPIGATEWAYENDPOINT"]
 })
@@ -40,7 +57,7 @@ export const handle = async (event: APIGatewayProxyEvent): Promise<APIGatewayPro
   const routeKey = event.requestContext.routeKey as Action;
   const connectionId = event.requestContext.connectionId as string;
 
-
+try {
   switch(routeKey) {
 
     case "$connect":
@@ -52,26 +69,61 @@ export const handle = async (event: APIGatewayProxyEvent): Promise<APIGatewayPro
     case "getClients":
       return handleGetClients(connectionId);
     
-    case "sendMessage" :
-      return 
-
+    case "sendMessages":
+      return handleSendMessage(connectionId, parseSendMessageBody(event.body));
+    case "getMessages":
+        return handleGetMessage(connectionId, parseGetMessageBody(event.body));
+  
     
     default:
       return {
         statusCode: 500,
-        body: JSON.stringify(
-          {
-            message: "Go Serverless v1.0! Your function executed successfully!",
-            input: event,
-          },
-          null,
-          2,
-        ),
+        body: ""
       };
-      
-  }
+    }
+  } catch (e) {
   
+    if (e instanceof HandlerError) {
+      await postToConnection(connectionId,e.message);
+
+      return responseOK;
+
+    }
+
+    throw e;
+
+  }
+
 };
+
+
+const parseSendMessageBody = (body:string |null):SendMessage => {
+
+  const sendMessage = JSON.parse(body || "{}") as SendMessage
+  if (
+    !sendMessage ||
+    typeof sendMessage.message !== "string" ||
+    typeof sendMessage.recipentNickname !== "string"    
+    ) {
+         throw new HandlerError("incorrect sendmessage format")
+    }
+  return sendMessage;
+
+}
+
+const parseGetMessageBody = (body:string | null):GetMessage  => {
+
+  const getMessage = JSON.parse(body || "{}") as GetMessage
+  if (
+    !getMessage ||
+    typeof getMessage.targetNickname !== "string" ||
+    typeof getMessage.limit !== "number"    
+    ) {
+         throw new HandlerError("incorrect getmessage format")
+    }
+  return getMessage;
+
+}
 
 
 const handleConnect = async(connectionId:string, queryParams: APIGatewayProxyEventQueryStringParameters | null,): 
@@ -89,27 +141,7 @@ Promise<APIGatewayProxyResult> => {
 // edge case where client with the same nickname try to connect
 // since nickname is used as secondary index
 
-const getConnectionIdByNickname = async (
-  nickname: string,
-): Promise<string | undefined> => {
-  const output = await docClient
-    .query({
-      TableName: CLIENT_TABLE_NAME,
-      IndexName: "NicknameIndex",
-      KeyConditionExpression: "#nickname = :nickname",
-      ExpressionAttributeNames: {
-        "#nickname": "nickname",
-      },
-      ExpressionAttributeValues: {
-        ":nickname": nickname,
-      },
-    })
-    .promise();
 
-  return output.Items && output.Items.length > 0
-    ? output.Items[0].connectionId
-    : undefined;
-};
 
 // for that nickname if count > 0 is that it means the connection exist
 
@@ -142,6 +174,28 @@ if (
 await notifyClients(connectionId); 
 return responseOK
   
+};
+
+const getConnectionIdByNickname = async (
+  nickname: string,
+): Promise<string | undefined> => {
+  const output = await docClient
+    .query({
+      TableName: CLIENT_TABLE_NAME,
+      IndexName: "NicknameIndex",
+      KeyConditionExpression: "#nickname = :nickname",
+      ExpressionAttributeNames: {
+        "#nickname": "nickname",
+      },
+      ExpressionAttributeValues: {
+        ":nickname": nickname,
+      },
+    })
+    .promise();
+
+  return output.Items && output.Items.length > 0
+    ? output.Items[0].connectionId
+    : undefined;
 };
 
 
@@ -250,5 +304,98 @@ const handleGetClients = async(connectionId:string): Promise<APIGatewayProxyResu
 const createClientMessage = (clients:Client[]):string => 
 
   JSON.stringify({type:"clients", value: {clients}} )
+
+
+const handleSendMessage = async (senderConnectionId: string,
+  body: SendMessage,
+  ): Promise<APIGatewayProxyResult> => {
+
+    
+    const senderClient = await getClient(senderConnectionId);
+    // the nicktonickname format should be joined with hash
+    const nicknameToNickname = getnicknameToNickname([senderClient.nickname, body.recipentNickname]);
+
+    await docClient.put({
+
+      TableName: MESSAGE_TABLE_NAME,
+      Item: {
+        // use uuid func to generate random hash
+        messageId: v4(),
+        createdAt: new Date().getMilliseconds,
+        nicknameToNickname: '',
+        message:body.message,
+        sender: senderClient.nickname
+      }
+
+    });
+
+    const recipentConnectionId = await getConnectionIdByNickname(body.recipentNickname);
+
+    if(recipentConnectionId) {
+      // the posttoconnection sends the payload to recipent this way ??
+      await postToConnection(recipentConnectionId, JSON.stringify({
+
+        type: 'message',
+        value: {
+          sender: senderClient.nickname,
+          message: body.message,
+
+        },
+      }))
+    }
+
+    return responseOK
+
+    
+
+}
+
+const getnicknameToNickname = (nicknames: string[]): string => nicknames.sort().join("#")
+
+// retrieve client 
+const getClient = async(connectionId:string)=> {
+  const output = await docClient.get({
+    TableName: CLIENT_TABLE_NAME,
+    Key: {
+      connectionId,
+    }
+  }).promise();
+
+  return output.Item as Client; 
+}
+
+const handleGetMessage = async(connectionId:string,body:GetMessage):Promise<APIGatewayProxyResult> => {
+  const client = await getClient(connectionId);// retrieve recipent
+
+  const output = await docClient.query({
+    TableName: MESSAGE_TABLE_NAME,
+    IndexName: "NicknameToNicknameIndex",
+    KeyConditionExpression: "#nicktonick = :nicknameToNickname",
+      ExpressionAttributeNames: {
+        "#nicktonick": "nicknameToNickname",
+      },
+      ExpressionAttributeValues: {
+        // retrieve sender and recip nicknames
+        ":nicknameToNickname": getnicknameToNickname([client.nickname,body.targetNickname]), 
+        
+      },
+      Limit: body.limit, // limit interms of fetching 
+      ExclusiveStartKey: body.startKey, // specfically for pagination purpose in the frontend...display of messages list
+      ScanIndexForward: false, // display messages from latest to oldest
+    
+  }).promise()
+
+  const messages = output.Items && output.Items.length > 0 ? output.Items: [];
+
+  await postToConnection(connectionId,JSON.stringify({
+    type:"messages",
+    value: {
+      messages,
+    },
+  }))
+
+  return responseOK;
+
+}
 
 
