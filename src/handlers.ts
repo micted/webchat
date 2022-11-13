@@ -321,11 +321,11 @@ const handleSendMessage = async (client: Client, body: SendMessage) => {
           nicknameToNickname,
           message: body.message,
           sender: client.nickname,
-          createdAt: new Date().getTime(),
+          createdAt: new Date().getTime(), // get time in ms
         },
       })
       .promise();
-  
+      
     const recipientConnectionId = await getConnectionIdByNickname(
       body.recipentNickname,
     );
