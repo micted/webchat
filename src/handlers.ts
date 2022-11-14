@@ -22,13 +22,12 @@ type SendMessage = {
   recipentNickname: string;
 }
 
-type  GetMessage = {
-  // the sender name
+type GetMessage = {
   targetNickname: string;
-  recipentNickname: string;
-  limit: number; // pagination
   startKey: Key | undefined;
+  limit: number;
 };
+
 
 
 
@@ -98,33 +97,7 @@ try {
 };
 
 
-const parseSendMessageBody = (body:string |null):SendMessage => {
 
-  const sendMessage = JSON.parse(body || "{}") as SendMessage
-  if (
-    !sendMessage ||
-    typeof sendMessage.message !== "string" ||
-    typeof sendMessage.recipentNickname !== "string"    
-    ) {
-         throw new HandlerError("incorrect sendmessage format")
-    }
-  return sendMessage;
-
-}
-
-const parseGetMessageBody = (body:string | null):GetMessage  => {
-
-  const getMessage = JSON.parse(body || "{}") as GetMessage
-  if (
-    !getMessage ||
-    typeof getMessage.targetNickname !== "string" ||
-    typeof getMessage.limit !== "number"    
-    ) {
-         throw new HandlerError("incorrect getmessage format")
-    }
-  return getMessage;
-
-}
 
 
 const handleConnect = async(connectionId:string, queryParams: APIGatewayProxyEventQueryStringParameters | null,): 
@@ -312,17 +285,19 @@ const handleSendMessage = async (client: Client, body: SendMessage) => {
       client.nickname,
       body.recipentNickname,
     ]);
+
+    const message = {
+      messageId: v4(),
+      nicknameToNickname,
+      message: body.message,
+      sender: client.nickname,
+      createdAt: new Date().getTime(), // get time in ms
+    };
   
     await docClient
       .put({
         TableName: MESSAGE_TABLE_NAME,
-        Item: {
-          messageId: v4(),
-          nicknameToNickname,
-          message: body.message,
-          sender: client.nickname,
-          createdAt: new Date().getTime(), // get time in ms
-        },
+        Item: message,
       })
       .promise();
       
@@ -337,8 +312,7 @@ const handleSendMessage = async (client: Client, body: SendMessage) => {
           Data: JSON.stringify({
             type: "message",
             value: {
-              sender: client.nickname,
-              message: body.message,
+              message,
             },
           }),
         })
@@ -360,6 +334,25 @@ const getClient = async(connectionId:string)=> {
 
   return output.Item as Client; 
 }
+
+// PARSE SEND MESSAGE
+const parseSendMessageBody = (body:string |null):SendMessage => {
+
+  const sendMessage = JSON.parse(body || "{}") as SendMessage
+  if (
+    !sendMessage ||
+    typeof sendMessage.message !== "string" ||
+    typeof sendMessage.recipentNickname !== "string"    
+    ) {
+         throw new HandlerError("incorrect sendmessage format")
+    }
+  return sendMessage;
+
+}
+
+
+
+
 
 const handleGetMessages = async (client: Client, body: GetMessage) => {
   const output = await docClient
@@ -395,3 +388,20 @@ const handleGetMessages = async (client: Client, body: GetMessage) => {
 
   return responseOK;
 };
+
+//PARSE GET MESSAGE
+
+const parseGetMessageBody = (body:string | null) => {
+
+  const getMessage = JSON.parse(body || "{}") as GetMessage
+  if (
+    !getMessage ||
+    !getMessage.targetNickname ||
+    !getMessage.limit
+  ) {
+         throw new HandlerError("incorrect getmessage format")
+         console.log(getMessage)
+    }
+  return getMessage;
+
+}
